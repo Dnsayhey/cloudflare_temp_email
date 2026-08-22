@@ -39,6 +39,33 @@ jobs:
             fi
           }
 
+          cf_api_diagnose() {
+            local method="$1"
+            local path="$2"
+            local data="${3:-}"
+            local response_file
+            response_file="$(mktemp)"
+            local status
+            if [ -n "$data" ]; then
+              status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+                --request "$method" \
+                --header "Authorization: Bearer $CF_API_TOKEN" \
+                --header "Content-Type: application/json" \
+                --data "$data" \
+                "https://api.cloudflare.com/client/v4$path")"
+            else
+              status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+                --request "$method" \
+                --header "Authorization: Bearer $CF_API_TOKEN" \
+                --header "Content-Type: application/json" \
+                "https://api.cloudflare.com/client/v4$path")"
+            fi
+            echo "Cloudflare API $method $path returned HTTP $status"
+            jq '{success, errors, messages, result}' "$response_file"
+            rm -f "$response_file"
+            [ "$status" -ge 200 ] && [ "$status" -lt 300 ]
+          }
+
           zone_response="$(cf_api GET "/zones?name=$MAIL_DOMAIN&account.id=$CF_ACCOUNT_ID")"
           zone_id="$(jq -r '.result[0].id // empty' <<<"$zone_response")"
           if [ -z "$zone_id" ]; then
@@ -48,18 +75,15 @@ jobs:
           fi
 
           echo "Found Cloudflare zone for $MAIL_DOMAIN"
-          routing_response="$(cf_api GET "/zones/$zone_id/email/routing")"
-          routing_enabled="$(jq -r '.result.enabled // false' <<<"$routing_response")"
-          if [ "$routing_enabled" != "true" ]; then
-            echo "Enabling Email Routing"
-            cf_api POST "/zones/$zone_id/email/routing/enable" | jq '{success, errors, result}'
-          else
-            echo "Email Routing is already enabled"
+          echo "Checking Email Routing status"
+          if ! cf_api_diagnose GET "/zones/$zone_id/email/routing"; then
+            echo "Status check was denied; attempting enable directly"
           fi
+          echo "Enabling Email Routing (safe to repeat)"
+          cf_api_diagnose POST "/zones/$zone_id/email/routing/enable"
 
           catch_all_payload="$(jq -nc --arg worker "$WORKER_NAME" '{name:"Catch all", enabled:true, matchers:[{type:"all"}], actions:[{type:"worker", value:[$worker]}]}')"
           echo "Configuring catch-all delivery to Worker $WORKER_NAME"
-          cf_api PUT "/zones/$zone_id/email/routing/rules/catch_all" "$catch_all_payload" \
-            | jq '{success, errors, result: {name: .result.name, enabled: .result.enabled, actions: .result.actions}}'
+          cf_api_diagnose PUT "/zones/$zone_id/email/routing/rules/catch_all" "$catch_all_payload"
 
           echo "Email Routing setup completed"
